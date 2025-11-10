@@ -129,6 +129,10 @@ class LockOnEnv(gym.Env):
         self.steps = 0
         self.total_bonus_earned = 0
 
+        # Action visualization (store last actions for rendering)
+        self.last_pursuer_action = np.zeros(2)
+        self.last_evader_action = np.zeros(2)
+
         # Evader state
         self.evader_momentum = np.zeros(2)
 
@@ -145,21 +149,29 @@ class LockOnEnv(gym.Env):
             np.ndarray: Evader's action [escape_x, escape_y]
         """
         if self.evader_type == "simple":
-            # Escape away from center
+            # Aggressive escape strategy
             # Current position relative to center
             dx = self.target_x
             dy = self.target_y
 
-            # Normalize and add noise
-            distance = np.sqrt(dx**2 + dy**2) + 1e-6
-            escape_direction = np.array([-dx, -dy]) / distance
+            # Strategy depends on whether we're in lock box or not
+            distance_from_center = np.sqrt(dx**2 + dy**2)
+            lock_box_radius = self.LOCK_BOX_SIZE / 2
 
-            # Add some random jitter
-            noise = np.random.randn(2) * 0.3 * self.evader_difficulty
-            action = escape_direction + noise
+            if distance_from_center < lock_box_radius * 0.7:
+                # Inside or near lock box: ESCAPE aggressively
+                escape_direction = np.array([-dx, -dy]) / (distance_from_center + 1e-6)
 
-            # Add momentum for smoother movement
-            self.evader_momentum = 0.7 * self.evader_momentum + 0.3 * action
+                # Add strong random jitter for unpredictability
+                noise = np.random.randn(2) * 0.6 * self.evader_difficulty
+                action = escape_direction * 1.2 + noise  # Amplified escape
+            else:
+                # Far from lock box: Random evasive maneuvers
+                noise = np.random.randn(2) * 0.8 * self.evader_difficulty
+                action = self.evader_momentum * 0.5 + noise
+
+            # Less momentum for more agility
+            self.evader_momentum = 0.5 * self.evader_momentum + 0.5 * action
             action = self.evader_momentum
 
             # Clip to valid range
@@ -401,10 +413,92 @@ class LockOnEnv(gym.Env):
             1
         )
 
-        # Draw target (evader)
+        # Draw action vectors (arrows)
         target_abs_x = self.CENTER_X + self.target_x
         target_abs_y = self.CENTER_Y + self.target_y
 
+        # Helper function to draw arrow
+        def draw_arrow(surf, color, start, end, width=2):
+            """Draw an arrow from start to end"""
+            # Draw line
+            pygame.draw.line(surf, color, start, end, width)
+
+            # Calculate arrow head
+            dx = end[0] - start[0]
+            dy = end[1] - start[1]
+            length = np.sqrt(dx*dx + dy*dy)
+
+            if length > 5:  # Only draw arrowhead if line is long enough
+                # Normalize
+                dx /= length
+                dy /= length
+
+                # Arrow head size
+                head_length = min(15, length * 0.3)
+                head_width = head_length * 0.6
+
+                # Perpendicular vector
+                perp_x = -dy
+                perp_y = dx
+
+                # Arrow head points
+                point1 = (
+                    int(end[0] - head_length * dx + head_width * perp_x),
+                    int(end[1] - head_length * dy + head_width * perp_y)
+                )
+                point2 = (
+                    int(end[0] - head_length * dx - head_width * perp_x),
+                    int(end[1] - head_length * dy - head_width * perp_y)
+                )
+
+                pygame.draw.polygon(surf, color, [end, point1, point2])
+
+        # Vector scale for visualization (larger for visibility)
+        vector_scale = 50
+
+        # Evader action vector (from target, RED)
+        if np.linalg.norm(self.last_evader_action) > 0.01:
+            evader_start = (int(target_abs_x), int(target_abs_y))
+            evader_end = (
+                int(target_abs_x + self.last_evader_action[0] * vector_scale),
+                int(target_abs_y + self.last_evader_action[1] * vector_scale)
+            )
+            draw_arrow(surface, (255, 100, 100), evader_start, evader_end, 3)
+
+        # Pursuer action vector (from center, BLUE)
+        if np.linalg.norm(self.last_pursuer_action) > 0.01:
+            pursuer_start = (self.CENTER_X, self.CENTER_Y)
+            pursuer_end = (
+                int(self.CENTER_X + self.last_pursuer_action[0] * vector_scale),
+                int(self.CENTER_Y + self.last_pursuer_action[1] * vector_scale)
+            )
+            draw_arrow(surface, (100, 100, 255), pursuer_start, pursuer_end, 3)
+
+        # Draw warning zone if target is close to screen edges
+        warning_margin = 100  # pixels from edge
+        target_center_x = target_abs_x
+        target_center_y = target_abs_y
+
+        near_left = target_center_x < warning_margin
+        near_right = target_center_x > self.screen_width - warning_margin
+        near_top = target_center_y < warning_margin
+        near_bottom = target_center_y > self.screen_height - warning_margin
+
+        in_warning_zone = near_left or near_right or near_top or near_bottom
+
+        if in_warning_zone:
+            # Draw red warning border
+            pygame.draw.rect(surface, (255, 0, 0),
+                           (0, 0, self.screen_width, self.screen_height), 5)
+
+            # Draw warning text
+            if self.render_mode == "human":
+                warning_text = "WARNING: TARGET ESCAPING!"
+                warning_surface = self.font.render(warning_text, True, (255, 0, 0))
+                text_rect = warning_surface.get_rect(center=(self.screen_width // 2, 30))
+                surface.blit(warning_surface, text_rect)
+
+        # Draw target (evader)
         target_rect = pygame.Rect(
             int(target_abs_x - self.target_width / 2),
             int(target_abs_y - self.target_height / 2),
@@ -412,26 +506,58 @@ class LockOnEnv(gym.Env):
             int(self.target_height)
         )
 
-        # Color: Red if not locked, Green if locked
-        target_color = (0, 255, 0) if self._is_locked_on() else (255, 0, 0)
+        # Color: Green if locked, Yellow if in warning zone, Red otherwise
+        if self._is_locked_on():
+            target_color = (0, 255, 0)  # Green - locked
+        elif in_warning_zone:
+            target_color = (255, 255, 0)  # Yellow - warning
+        else:
+            target_color = (255, 0, 0)  # Red - normal
+
         pygame.draw.rect(surface, target_color, target_rect)
 
         # Draw lock-on indicator
         if self.render_mode == "human":
+            y_offset = 10
+
+            # Lock progress
             lock_progress = self.lock_on_timer / self.LOCK_ON_STEPS
             lock_text = f"Lock: {lock_progress*100:.1f}%"
             text_surface = self.small_font.render(lock_text, True, (255, 255, 255))
-            surface.blit(text_surface, (10, 10))
+            surface.blit(text_surface, (10, y_offset))
+            y_offset += 30
 
-            # Draw total bonuses earned
+            # Total bonuses
             bonus_text = f"Bonuses: {self.total_bonus_earned}"
             bonus_surface = self.small_font.render(bonus_text, True, (255, 255, 0))
-            surface.blit(bonus_surface, (10, 40))
+            surface.blit(bonus_surface, (10, y_offset))
+            y_offset += 30
 
-            # Draw steps
+            # Steps
             steps_text = f"Steps: {self.steps}"
             steps_surface = self.small_font.render(steps_text, True, (200, 200, 200))
-            surface.blit(steps_surface, (10, 70))
+            surface.blit(steps_surface, (10, y_offset))
+            y_offset += 30
+
+            # Vector magnitudes
+            pursuer_mag = np.linalg.norm(self.last_pursuer_action)
+            evader_mag = np.linalg.norm(self.last_evader_action)
+
+            pursuer_text = f"Pursuer: {pursuer_mag:.2f}"
+            pursuer_surface = self.small_font.render(pursuer_text, True, (100, 100, 255))
+            surface.blit(pursuer_surface, (10, y_offset))
+            y_offset += 25
+
+            evader_text = f"Evader: {evader_mag:.2f}"
+            evader_surface = self.small_font.render(evader_text, True, (255, 100, 100))
+            surface.blit(evader_surface, (10, y_offset))
+            y_offset += 25
+
+            # Distance from center
+            distance = np.sqrt(self.target_x**2 + self.target_y**2)
+            distance_text = f"Distance: {distance:.0f}px"
+            distance_surface = self.small_font.render(distance_text, True, (200, 200, 200))
+            surface.blit(distance_surface, (10, y_offset))
 
         # Convert to RGB array
         frame = pygame.surfarray.array3d(surface)
@@ -453,10 +579,12 @@ class LockOnEnv(gym.Env):
         """
         super().reset(seed=seed)
 
-        # Reset target to random position near center
-        self.target_x = self.np_random.uniform(-50, 50)
-        self.target_y = self.np_random.uniform(-50, 50)
-        self.target_distance = self.np_random.uniform(0.8, 1.2)
+        # Reset target to random position (wider area for more movement)
+        # Can start anywhere in the lock box
+        max_offset = self.LOCK_BOX_SIZE // 3
+        self.target_x = self.np_random.uniform(-max_offset, max_offset)
+        self.target_y = self.np_random.uniform(-max_offset, max_offset)
+        self.target_distance = self.np_random.uniform(0.5, 1.5)
 
         # Calculate initial size
         # Target should fill 30% of lock box at distance=1.0
@@ -472,6 +600,10 @@ class LockOnEnv(gym.Env):
         self.steps = 0
         self.total_bonus_earned = 0
         self.evader_momentum = np.zeros(2)
+
+        # Reset action visualization
+        self.last_pursuer_action = np.zeros(2)
+        self.last_evader_action = np.zeros(2)
 
         observation = self._get_observation()
         info = self._get_info()
@@ -499,6 +631,10 @@ class LockOnEnv(gym.Env):
 
         # Get evader's action
         evader_action = self._get_evader_action()
+
+        # Store actions for visualization
+        self.last_pursuer_action = action.copy()
+        self.last_evader_action = evader_action.copy()
 
         # Update target position and size
         self._update_target_position(action, evader_action)
@@ -529,6 +665,18 @@ class LockOnEnv(gym.Env):
         Returns:
             dict: Information dictionary
         """
+        # Check if in warning zone
+        target_abs_x = self.CENTER_X + self.target_x
+        target_abs_y = self.CENTER_Y + self.target_y
+        warning_margin = 100
+
+        in_warning_zone = (
+            target_abs_x < warning_margin or
+            target_abs_x > self.screen_width - warning_margin or
+            target_abs_y < warning_margin or
+            target_abs_y > self.screen_height - warning_margin
+        )
+
         return {
             "target_x": self.target_x,
             "target_y": self.target_y,
@@ -537,7 +685,11 @@ class LockOnEnv(gym.Env):
             "lock_on_progress": self.lock_on_timer / self.LOCK_ON_STEPS,
             "is_locked": self._is_locked_on(),
             "total_bonuses": self.total_bonus_earned,
-            "steps": self.steps
+            "steps": self.steps,
+            "in_warning_zone": in_warning_zone,
+            "pursuer_action_magnitude": float(np.linalg.norm(self.last_pursuer_action)),
+            "evader_action_magnitude": float(np.linalg.norm(self.last_evader_action)),
+            "distance_from_center": float(np.sqrt(self.target_x**2 + self.target_y**2))
         }
 
     def render(self) -> Optional[np.ndarray]:
