@@ -16,7 +16,8 @@ class LockOnEnv(gym.Env):
     Egocentric target tracking environment simulating a lock-on system.
 
     The pursuer agent must track a fast, agile evader and maintain lock-on
-    for 5 consecutive seconds to succeed.
+    for 5 consecutive seconds to succeed. The evader can win by escaping
+    beyond screen boundaries.
 
     Lock-on Conditions:
         1. Target must be inside the lock box (center square, 30% of screen)
@@ -32,15 +33,25 @@ class LockOnEnv(gym.Env):
         - pan_x: horizontal correction vector
         - tilt_y: vertical correction vector
 
-    Reward Function:
+    Reward Function (from pursuer's perspective):
         - Centering error penalty: -(x_diff^2 + y_diff^2) * 0.001
         - Size error penalty: -(size_error^2) * 0.00001
         - Lock-on reward: +1 per step when locked
         - Big bonus: +500 for maintaining lock for 5 seconds
-        - Termination penalty: -1000 if target escapes
+        - Escape penalty: -1000 if target escapes (evader wins!)
+
+    Realistic Flight Physics:
+        - Momentum/inertia: Velocity-based movement with acceleration limits
+        - Drag: Air resistance slows down targets over time
+        - Angular velocity limits: Can't turn instantly
+        - Speed-turn trade-off: High speed reduces turn rate
+        - Stall mechanics: Minimum speed required or lose control
+        - Escape mechanics: Target can escape beyond screen boundaries
 
     Evader Dynamics:
         - Evader is faster than pursuer (1.5x speed multiplier by default)
+        - Evader has better acceleration (1.3x) and turn rate (1.2x)
+        - Smart strategies: aggressive, zigzag, spiral, edge-seeking
         - Makes tracking challenging and requires skilled control
     """
 
@@ -91,6 +102,20 @@ class LockOnEnv(gym.Env):
         self.TARGET_FILL_RATIO = 0.05  # Target should fill at least 5% of lock box
         self.TARGET_FILL_TOLERANCE = 1.0  # Accept any size >= 5%
 
+        # Realistic Flight Physics Constants
+        self.MAX_SPEED = 15.0  # Maximum speed (pixels/frame)
+        self.MIN_SPEED = 3.0   # Minimum speed (below this = stall)
+        self.MAX_ACCELERATION = 0.5  # Maximum acceleration
+        self.DRAG_COEFFICIENT = 0.02  # Air resistance
+        self.MAX_ANGULAR_VELOCITY = np.deg2rad(5)  # Max turn rate (degrees/frame)
+        self.TURN_SPEED_FACTOR = 0.7  # High speed reduces turn rate
+        self.STALL_RECOVERY_TIME = 20  # Frames to recover from stall
+
+        # Evader gets better stats (more agile fighter)
+        self.EVADER_MAX_SPEED = self.MAX_SPEED * evader_speed_multiplier
+        self.EVADER_MAX_ACCELERATION = self.MAX_ACCELERATION * 1.3
+        self.EVADER_MAX_ANGULAR_VELOCITY = self.MAX_ANGULAR_VELOCITY * 1.2
+
         # Action space: [pan_x, tilt_y]
         self.action_space = spaces.Box(
             low=-1.0, high=1.0, shape=(2,), dtype=np.float32
@@ -131,13 +156,24 @@ class LockOnEnv(gym.Env):
         self.total_lock_time = 0.0
         self.steps = 0
         self.total_bonus_earned = 0
+        self.escape_count = 0  # Track successful escapes
+
+        # Realistic Physics State
+        self.target_velocity = np.zeros(2)  # [vx, vy] velocity vector
+        self.target_speed = 0.0  # Speed magnitude
+        self.target_heading = 0.0  # Direction in radians
+        self.target_angular_velocity = 0.0  # Turn rate
+        self.is_stalled = False
+        self.stall_timer = 0
 
         # Action visualization (store last actions for rendering)
         self.last_pursuer_action = np.zeros(2)
         self.last_evader_action = np.zeros(2)
 
-        # Evader state
-        self.evader_momentum = np.zeros(2)
+        # Evader strategy state
+        self.evader_strategy = "aggressive"  # aggressive, zigzag, spiral, edge
+        self.evader_strategy_timer = 0
+        self.evader_zigzag_phase = 0
 
         # Observation delay buffer (makes tracking harder)
         # Agent sees observations from 'observation_delay' frames ago
@@ -150,36 +186,123 @@ class LockOnEnv(gym.Env):
 
     def _get_evader_action(self) -> np.ndarray:
         """
-        Generate evader's action based on evader_type.
+        Generate evader's action based on evader_type and smart strategies.
+
+        Strategies:
+        - aggressive: Escape away from center (straight line)
+        - zigzag: Periodic lateral movements
+        - spiral: Circular escape pattern
+        - edge: Move toward screen edges for escape
 
         Returns:
             np.ndarray: Evader's action [escape_x, escape_y]
         """
         if self.evader_type == "simple":
-            # Aggressive escape strategy
-            # Current position relative to center
+            # Smart evader with multiple strategies
             dx = self.target_x
             dy = self.target_y
-
-            # Strategy depends on whether we're in lock box or not
             distance_from_center = np.sqrt(dx**2 + dy**2)
             lock_box_radius = self.LOCK_BOX_SIZE / 2
 
-            if distance_from_center < lock_box_radius * 0.7:
-                # Inside or near lock box: ESCAPE aggressively
-                escape_direction = np.array([-dx, -dy]) / (distance_from_center + 1e-6)
+            # Update strategy timer
+            self.evader_strategy_timer += 1
 
-                # Add strong random jitter for unpredictability
-                noise = np.random.randn(2) * 0.6 * self.evader_difficulty
-                action = escape_direction * 1.2 + noise  # Amplified escape
+            # Switch strategies based on situation
+            is_locked = self._is_locked_on()
+            in_lock_box = distance_from_center < lock_box_radius
+
+            # Strategy selection
+            if is_locked:
+                # PANIC: Use aggressive escape when locked
+                self.evader_strategy = "aggressive"
+                self.evader_strategy_timer = 0
+            elif in_lock_box:
+                # In danger zone: use zigzag or spiral
+                if self.evader_strategy_timer > 60:  # Switch every 2 seconds
+                    self.evader_strategy = self.np_random.choice(["zigzag", "spiral"])
+                    self.evader_strategy_timer = 0
             else:
-                # Far from lock box: Random evasive maneuvers
-                noise = np.random.randn(2) * 0.8 * self.evader_difficulty
-                action = self.evader_momentum * 0.5 + noise
+                # Safe zone: head for edges to escape
+                if distance_from_center > lock_box_radius * 1.5:
+                    self.evader_strategy = "edge"
 
-            # Less momentum for more agility
-            self.evader_momentum = 0.5 * self.evader_momentum + 0.5 * action
-            action = self.evader_momentum
+            # Execute strategy
+            if self.evader_strategy == "aggressive":
+                # Straight escape away from center
+                if distance_from_center > 1e-6:
+                    escape_direction = np.array([dx, dy]) / distance_from_center
+                else:
+                    escape_direction = np.random.randn(2)
+                    escape_direction /= np.linalg.norm(escape_direction)
+
+                action = escape_direction * 1.0
+
+            elif self.evader_strategy == "zigzag":
+                # Zigzag pattern: move away + periodic lateral
+                self.evader_zigzag_phase += 0.2
+
+                # Primary escape direction
+                if distance_from_center > 1e-6:
+                    escape_direction = np.array([dx, dy]) / distance_from_center
+                else:
+                    escape_direction = np.array([1.0, 0.0])
+
+                # Perpendicular direction for zigzag
+                perpendicular = np.array([-escape_direction[1], escape_direction[0]])
+
+                # Zigzag component
+                zigzag_amplitude = np.sin(self.evader_zigzag_phase) * 0.7
+
+                action = escape_direction * 0.7 + perpendicular * zigzag_amplitude
+
+            elif self.evader_strategy == "spiral":
+                # Spiral outward from center
+                angle = np.arctan2(dy, dx)
+                angle += 0.1  # Rotate
+                radius = distance_from_center + 2.0  # Expand outward
+
+                target_x = radius * np.cos(angle)
+                target_y = radius * np.sin(angle)
+
+                # Direction toward spiral point
+                direction = np.array([target_x - dx, target_y - dy])
+                direction_norm = np.linalg.norm(direction)
+                if direction_norm > 1e-6:
+                    direction /= direction_norm
+
+                action = direction * 1.0
+
+            elif self.evader_strategy == "edge":
+                # Move toward nearest screen edge for escape
+                target_abs_x = self.CENTER_X + dx
+                target_abs_y = self.CENTER_Y + dy
+
+                # Calculate distances to edges
+                dist_left = target_abs_x
+                dist_right = self.screen_width - target_abs_x
+                dist_top = target_abs_y
+                dist_bottom = self.screen_height - target_abs_y
+
+                # Find nearest edge
+                min_dist = min(dist_left, dist_right, dist_top, dist_bottom)
+
+                # Move toward nearest edge
+                if min_dist == dist_left:
+                    action = np.array([-1.0, 0.0])
+                elif min_dist == dist_right:
+                    action = np.array([1.0, 0.0])
+                elif min_dist == dist_top:
+                    action = np.array([0.0, -1.0])
+                else:
+                    action = np.array([0.0, 1.0])
+
+            else:
+                # Default: aggressive
+                action = np.random.randn(2)
+
+            # Add small random noise for unpredictability
+            noise = np.random.randn(2) * 0.1 * self.evader_difficulty
+            action += noise
 
             # Clip to valid range
             action = np.clip(action, -1.0, 1.0)
@@ -195,7 +318,7 @@ class LockOnEnv(gym.Env):
         elif self.evader_type == "learned":
             # Placeholder for learned evader (MARL Phase 2)
             # For now, use simple evader
-            return self._get_evader_action_simple()
+            return self._get_evader_action()
 
         else:
             raise ValueError(f"Invalid evader_type: {self.evader_type}")
@@ -206,36 +329,124 @@ class LockOnEnv(gym.Env):
         evader_action: np.ndarray
     ) -> None:
         """
-        Update target position and size based on net motion vector.
+        Update target position with realistic flight physics.
 
-        Physics:
-            net_vector_xy = (evader_action * evader_speed_multiplier) - pursuer_action
-            position += net_vector_xy * speed_coefficient
+        Physics includes:
+        - Momentum/inertia (velocity-based movement)
+        - Acceleration limits
+        - Drag/air resistance
+        - Angular velocity limits (can't turn instantly)
+        - Speed-turn trade-off (high speed = slow turns)
+        - Stall mechanics (minimum speed requirement)
 
-        Evader is more agile/fast than pursuer, making tracking challenging.
+        Evader has better stats (faster, more agile) making tracking challenging.
         """
-        # X-Y position update
-        # Evader is faster/more agile (multiplied by evader_speed_multiplier)
+        # Calculate net motion vector
         evader_x = evader_action[0] * self.evader_speed_multiplier
         evader_y = evader_action[1] * self.evader_speed_multiplier
 
         net_vector_x = evader_x - pursuer_action[0]
         net_vector_y = evader_y - pursuer_action[1]
 
-        self.target_x += net_vector_x * self.speed_coefficient
-        self.target_y += net_vector_y * self.speed_coefficient
+        # Calculate desired velocity from actions
+        desired_velocity = np.array([net_vector_x, net_vector_y]) * self.speed_coefficient
 
-        # Evader also has a "distance" action (simplified: random walk in Z)
-        # This affects target size
+        # 1. Calculate acceleration (with limits)
+        velocity_diff = desired_velocity - self.target_velocity
+        acceleration_direction = velocity_diff / (np.linalg.norm(velocity_diff) + 1e-6)
+        acceleration_magnitude = min(
+            np.linalg.norm(velocity_diff),
+            self.EVADER_MAX_ACCELERATION
+        )
+        acceleration = acceleration_direction * acceleration_magnitude
+
+        # 2. Apply acceleration to velocity
+        self.target_velocity += acceleration
+
+        # 3. Apply drag (air resistance)
+        self.target_velocity *= (1.0 - self.DRAG_COEFFICIENT)
+
+        # 4. Calculate current speed and heading
+        self.target_speed = np.linalg.norm(self.target_velocity)
+
+        if self.target_speed > 0.01:
+            self.target_heading = np.arctan2(self.target_velocity[1], self.target_velocity[0])
+
+        # 5. Check for stall condition
+        if self.target_speed < self.MIN_SPEED and not self.is_stalled:
+            self.is_stalled = True
+            self.stall_timer = self.STALL_RECOVERY_TIME
+
+        # 6. Handle stall recovery
+        if self.is_stalled:
+            self.stall_timer -= 1
+
+            # During stall, lose control and slow down further
+            self.target_velocity *= 0.95
+
+            # Try to recover by adding forward momentum
+            recovery_force = np.array([
+                np.cos(self.target_heading),
+                np.sin(self.target_heading)
+            ]) * 0.2
+
+            self.target_velocity += recovery_force
+
+            # Exit stall when timer expires and speed recovered
+            if self.stall_timer <= 0 and self.target_speed >= self.MIN_SPEED:
+                self.is_stalled = False
+
+        # 7. Apply angular velocity limits (speed-turn trade-off)
+        if not self.is_stalled and self.target_speed > 0.01:
+            # Calculate desired heading from velocity
+            desired_heading = np.arctan2(self.target_velocity[1], self.target_velocity[0])
+
+            # Calculate angular difference
+            angle_diff = desired_heading - self.target_heading
+            # Normalize to [-pi, pi]
+            while angle_diff > np.pi:
+                angle_diff -= 2 * np.pi
+            while angle_diff < -np.pi:
+                angle_diff += 2 * np.pi
+
+            # Speed-turn trade-off: higher speed = slower turn rate
+            speed_factor = self.target_speed / self.EVADER_MAX_SPEED
+            effective_max_angular_velocity = self.EVADER_MAX_ANGULAR_VELOCITY * (
+                1.0 - self.TURN_SPEED_FACTOR * speed_factor
+            )
+
+            # Limit angular change
+            max_angle_change = effective_max_angular_velocity
+            actual_angle_change = np.clip(angle_diff, -max_angle_change, max_angle_change)
+
+            # Update heading
+            self.target_heading += actual_angle_change
+
+            # Adjust velocity to match limited heading
+            self.target_velocity = np.array([
+                np.cos(self.target_heading) * self.target_speed,
+                np.sin(self.target_heading) * self.target_speed
+            ])
+
+        # 8. Clamp speed to valid range (if not stalled)
+        if not self.is_stalled:
+            if self.target_speed > self.EVADER_MAX_SPEED:
+                self.target_velocity *= self.EVADER_MAX_SPEED / self.target_speed
+                self.target_speed = self.EVADER_MAX_SPEED
+
+        # 9. Update position from velocity
+        self.target_x += self.target_velocity[0]
+        self.target_y += self.target_velocity[1]
+
+        # 10. Distance/size update (Z-axis simplified)
         evader_z = np.random.randn() * 0.1 * self.evader_difficulty
-        pursuer_z = 0.0  # Pursuer doesn't control zoom in this version
+        pursuer_z = 0.0
         net_vector_z = evader_z - pursuer_z
 
         self.target_distance += net_vector_z * 0.5
         self.target_distance = np.clip(self.target_distance, 0.3, 3.0)
 
         # Convert distance to size (inverse relationship)
-        # At distance=1.0, target should fill 30% of lock box
         desired_target_area = self.LOCK_BOX_AREA * self.TARGET_FILL_RATIO
         base_size = np.sqrt(desired_target_area)
         size = base_size / self.target_distance
@@ -289,10 +500,13 @@ class LockOnEnv(gym.Env):
 
     def _is_target_escaped(self) -> bool:
         """
-        Check if target has escaped (outside screen bounds).
+        Check if target has successfully escaped (completely outside screen bounds).
+
+        In the new physics model, escape is a SUCCESS for the evader, not a failure.
+        This makes the simulation more realistic - evaders can actually win by escaping.
 
         Returns:
-            bool: True if target is outside screen
+            bool: True if target is completely outside screen (successful escape)
         """
         half_width = self.target_width / 2
         half_height = self.target_height / 2
@@ -300,21 +514,22 @@ class LockOnEnv(gym.Env):
         abs_x = self.CENTER_X + self.target_x
         abs_y = self.CENTER_Y + self.target_y
 
+        # Target is escaped when completely outside screen bounds
         escaped_x = (abs_x + half_width < 0) or (abs_x - half_width > self.screen_width)
         escaped_y = (abs_y + half_height < 0) or (abs_y - half_height > self.screen_height)
 
         return escaped_x or escaped_y
 
-    def _calculate_reward(self, terminated: bool) -> float:
+    def _calculate_reward(self, terminated: bool, escaped: bool) -> float:
         """
         Calculate reward for current step.
 
-        Reward components:
+        Reward components (from pursuer's perspective):
         1. Penalty for being off-center
-        2. Penalty for wrong size (should fill 30% of lock box)
+        2. Penalty for wrong size (should fill 5% of lock box)
         3. Reward for successful lock-on (+1 per step)
         4. Big bonus for maintaining lock for 5 seconds (+500)
-        5. Penalty for escape (-1000)
+        5. BIG PENALTY for target escape (-1000) - evader wins!
 
         Returns:
             float: Reward value
@@ -326,7 +541,7 @@ class LockOnEnv(gym.Env):
         reward -= position_error * 0.001  # Scale down for stability
 
         # 2. Size error penalty
-        # Target should fill 30% of lock box
+        # Target should fill 5% of lock box
         current_area = self.target_width * self.target_height
         desired_area = self.LOCK_BOX_AREA * self.TARGET_FILL_RATIO
         area_error = (desired_area - current_area) ** 2
@@ -345,9 +560,10 @@ class LockOnEnv(gym.Env):
         else:
             self.lock_on_timer = 0
 
-        # 5. Termination penalty
-        if terminated:
+        # 5. Escape penalty (evader successfully escaped!)
+        if terminated and escaped:
             reward -= 1000.0
+            self.escape_count += 1
 
         return reward
 
@@ -572,6 +788,40 @@ class LockOnEnv(gym.Env):
             delay_text = f"Delay: {delay_sec:.1f}s"
             delay_surface = self.small_font.render(delay_text, True, (255, 165, 0))  # Orange
             surface.blit(delay_surface, (10, y_offset))
+            y_offset += 25
+
+            # Physics info
+            speed_text = f"Speed: {self.target_speed:.1f}px/f"
+            speed_color = (0, 255, 0) if self.target_speed >= self.MIN_SPEED else (255, 0, 0)
+            speed_surface = self.small_font.render(speed_text, True, speed_color)
+            surface.blit(speed_surface, (10, y_offset))
+            y_offset += 25
+
+            # Heading (in degrees)
+            heading_deg = np.rad2deg(self.target_heading) % 360
+            heading_text = f"Heading: {heading_deg:.0f}\u00b0"
+            heading_surface = self.small_font.render(heading_text, True, (150, 150, 255))
+            surface.blit(heading_surface, (10, y_offset))
+            y_offset += 25
+
+            # Stall warning
+            if self.is_stalled:
+                stall_text = f"STALL! ({self.stall_timer})"
+                stall_surface = self.small_font.render(stall_text, True, (255, 0, 0))
+                surface.blit(stall_surface, (10, y_offset))
+                y_offset += 25
+
+            # Evader strategy
+            strategy_text = f"Strategy: {self.evader_strategy.upper()}"
+            strategy_surface = self.small_font.render(strategy_text, True, (255, 255, 100))
+            surface.blit(strategy_surface, (10, y_offset))
+            y_offset += 25
+
+            # Escape count
+            if self.escape_count > 0:
+                escape_text = f"Escapes: {self.escape_count}"
+                escape_surface = self.small_font.render(escape_text, True, (255, 0, 255))
+                surface.blit(escape_surface, (10, y_offset))
 
         # Convert to RGB array
         frame = pygame.surfarray.array3d(surface)
@@ -614,6 +864,19 @@ class LockOnEnv(gym.Env):
         self.steps = 0
         self.total_bonus_earned = 0
         self.evader_momentum = np.zeros(2)
+
+        # Reset physics state
+        self.target_velocity = np.zeros(2)
+        self.target_speed = 0.0
+        self.target_heading = self.np_random.uniform(0, 2 * np.pi)  # Random initial heading
+        self.target_angular_velocity = 0.0
+        self.is_stalled = False
+        self.stall_timer = 0
+
+        # Reset evader strategy
+        self.evader_strategy = "aggressive"
+        self.evader_strategy_timer = 0
+        self.evader_zigzag_phase = 0
 
         # Reset action visualization
         self.last_pursuer_action = np.zeros(2)
@@ -662,11 +925,12 @@ class LockOnEnv(gym.Env):
         self._update_target_position(action, evader_action)
 
         # Check termination conditions
-        terminated = self._is_target_escaped()
+        escaped = self._is_target_escaped()
+        terminated = escaped  # Episode ends when target escapes
         truncated = False  # Gymnasium handles max_episode_steps
 
         # Calculate reward
-        reward = self._calculate_reward(terminated)
+        reward = self._calculate_reward(terminated, escaped)
 
         # Get current (true) observation
         current_observation = self._get_observation()
@@ -725,7 +989,17 @@ class LockOnEnv(gym.Env):
             "evader_action_magnitude": float(np.linalg.norm(self.last_evader_action)),
             "distance_from_center": float(np.sqrt(self.target_x**2 + self.target_y**2)),
             "observation_delay_frames": self.observation_delay,
-            "observation_delay_seconds": self.observation_delay / self.FPS
+            "observation_delay_seconds": self.observation_delay / self.FPS,
+            # Physics info
+            "target_speed": float(self.target_speed),
+            "target_velocity_x": float(self.target_velocity[0]),
+            "target_velocity_y": float(self.target_velocity[1]),
+            "target_heading": float(self.target_heading),
+            "target_heading_degrees": float(np.rad2deg(self.target_heading) % 360),
+            "is_stalled": self.is_stalled,
+            "stall_timer": self.stall_timer,
+            "evader_strategy": self.evader_strategy,
+            "escape_count": self.escape_count
         }
 
     def render(self) -> Optional[np.ndarray]:
