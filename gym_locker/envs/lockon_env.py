@@ -14,8 +14,13 @@ class LockOnEnv(gym.Env):
     """
     Egocentric target tracking environment simulating a lock-on system.
 
-    The pursuer agent tries to keep the evader (target) centered on screen
-    at a specific size (representing distance) for 5 seconds to achieve lock-on.
+    The pursuer agent must track a fast, agile evader and maintain lock-on
+    for 5 consecutive seconds to succeed.
+
+    Lock-on Conditions:
+        1. Target must be FULLY inside the lock box (center square, 30% of screen)
+        2. Target must fill approximately 30% of the lock box area
+        Both conditions must be maintained for 5 seconds for successful lock-on.
 
     State Space:
         - Option A (Vector): [x_diff, y_diff, width, height] - Shape (4,)
@@ -27,11 +32,15 @@ class LockOnEnv(gym.Env):
         - tilt_y: vertical correction vector
 
     Reward Function:
-        - Centering error penalty: -(x_diff^2 + y_diff^2)
-        - Size error penalty: -(size_error^2) * 0.1
+        - Centering error penalty: -(x_diff^2 + y_diff^2) * 0.001
+        - Size error penalty: -(size_error^2) * 0.00001
         - Lock-on reward: +1 per step when locked
         - Big bonus: +500 for maintaining lock for 5 seconds
         - Termination penalty: -1000 if target escapes
+
+    Evader Dynamics:
+        - Evader is faster than pursuer (1.5x speed multiplier by default)
+        - Makes tracking challenging and requires skilled control
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
@@ -42,8 +51,9 @@ class LockOnEnv(gym.Env):
         state_mode: str = "vector",  # "vector" or "image"
         screen_width: int = 800,
         screen_height: int = 600,
-        target_area_ratio: float = 0.30,  # Target should occupy 30% of screen
+        target_area_ratio: float = 0.30,  # Lock box size (30% of screen)
         speed_coefficient: float = 2.0,
+        evader_speed_multiplier: float = 1.5,  # Evader is faster than pursuer
         evader_type: str = "simple",  # "simple", "random", or "learned"
         evader_difficulty: float = 0.5,  # 0.0 (easy) to 1.0 (hard)
     ):
@@ -56,6 +66,7 @@ class LockOnEnv(gym.Env):
         self.screen_height = screen_height
         self.target_area_ratio = target_area_ratio
         self.speed_coefficient = speed_coefficient
+        self.evader_speed_multiplier = evader_speed_multiplier
         self.evader_type = evader_type
         self.evader_difficulty = evader_difficulty
 
@@ -66,11 +77,16 @@ class LockOnEnv(gym.Env):
         self.CENTER_X = screen_width // 2
         self.CENTER_Y = screen_height // 2
         self.SCREEN_AREA = screen_width * screen_height
-        self.TARGET_AREA = self.SCREEN_AREA * target_area_ratio
 
-        # Lock-on tolerance (how close to perfect to count as "locked")
-        self.LOCK_POSITION_TOLERANCE = 30  # pixels
-        self.LOCK_SIZE_TOLERANCE = 0.05  # 5% area difference
+        # Lock box area (30% of screen)
+        self.LOCK_BOX_AREA = self.SCREEN_AREA * target_area_ratio
+        self.LOCK_BOX_SIZE = int(np.sqrt(self.LOCK_BOX_AREA))
+
+        # Lock-on conditions:
+        # 1. Target must be FULLY inside the lock box
+        # 2. Target must fill 30% of the lock box (with tolerance)
+        self.TARGET_FILL_RATIO = 0.30  # Target should fill 30% of lock box
+        self.TARGET_FILL_TOLERANCE = 0.10  # Accept 20%-40% (30% ± 10%)
 
         # Action space: [pan_x, tilt_y]
         self.action_space = spaces.Box(
@@ -174,12 +190,18 @@ class LockOnEnv(gym.Env):
         Update target position and size based on net motion vector.
 
         Physics:
-            net_vector_xy = evader_action - pursuer_action
+            net_vector_xy = (evader_action * evader_speed_multiplier) - pursuer_action
             position += net_vector_xy * speed_coefficient
+
+        Evader is more agile/fast than pursuer, making tracking challenging.
         """
         # X-Y position update
-        net_vector_x = evader_action[0] - pursuer_action[0]
-        net_vector_y = evader_action[1] - pursuer_action[1]
+        # Evader is faster/more agile (multiplied by evader_speed_multiplier)
+        evader_x = evader_action[0] * self.evader_speed_multiplier
+        evader_y = evader_action[1] * self.evader_speed_multiplier
+
+        net_vector_x = evader_x - pursuer_action[0]
+        net_vector_y = evader_y - pursuer_action[1]
 
         self.target_x += net_vector_x * self.speed_coefficient
         self.target_y += net_vector_y * self.speed_coefficient
@@ -194,8 +216,9 @@ class LockOnEnv(gym.Env):
         self.target_distance = np.clip(self.target_distance, 0.3, 3.0)
 
         # Convert distance to size (inverse relationship)
-        # At distance=1.0, target should be at TARGET_AREA
-        base_size = np.sqrt(self.TARGET_AREA)
+        # At distance=1.0, target should fill 30% of lock box
+        desired_target_area = self.LOCK_BOX_AREA * self.TARGET_FILL_RATIO
+        base_size = np.sqrt(desired_target_area)
         size = base_size / self.target_distance
 
         self.target_width = size
@@ -205,18 +228,45 @@ class LockOnEnv(gym.Env):
         """
         Check if target is currently locked on.
 
+        Lock-on conditions:
+        1. Target must be FULLY inside the lock box (centered square)
+        2. Target must fill approximately 30% of the lock box area
+
         Returns:
-            bool: True if position and size are within tolerance
+            bool: True if both conditions are met
         """
-        position_error = np.sqrt(self.target_x**2 + self.target_y**2)
+        # Calculate target's absolute position and bounds
+        target_abs_x = self.CENTER_X + self.target_x
+        target_abs_y = self.CENTER_Y + self.target_y
 
-        current_area = self.target_width * self.target_height
-        area_error = abs(self.TARGET_AREA - current_area) / self.TARGET_AREA
+        target_left = target_abs_x - self.target_width / 2
+        target_right = target_abs_x + self.target_width / 2
+        target_top = target_abs_y - self.target_height / 2
+        target_bottom = target_abs_y + self.target_height / 2
 
-        position_locked = position_error < self.LOCK_POSITION_TOLERANCE
-        size_locked = area_error < self.LOCK_SIZE_TOLERANCE
+        # Calculate lock box bounds (centered square)
+        lock_box_left = self.CENTER_X - self.LOCK_BOX_SIZE / 2
+        lock_box_right = self.CENTER_X + self.LOCK_BOX_SIZE / 2
+        lock_box_top = self.CENTER_Y - self.LOCK_BOX_SIZE / 2
+        lock_box_bottom = self.CENTER_Y + self.LOCK_BOX_SIZE / 2
 
-        return position_locked and size_locked
+        # Condition 1: Target must be FULLY inside the lock box
+        inside_box = (
+            target_left >= lock_box_left and
+            target_right <= lock_box_right and
+            target_top >= lock_box_top and
+            target_bottom <= lock_box_bottom
+        )
+
+        # Condition 2: Target must fill ~30% of lock box area
+        target_area = self.target_width * self.target_height
+        fill_ratio = target_area / self.LOCK_BOX_AREA
+
+        # Check if fill ratio is within acceptable range (30% ± tolerance)
+        fill_ok = abs(fill_ratio - self.TARGET_FILL_RATIO) <= self.TARGET_FILL_TOLERANCE
+
+        # Both conditions must be true for successful lock-on
+        return inside_box and fill_ok
 
     def _is_target_escaped(self) -> bool:
         """
@@ -240,6 +290,13 @@ class LockOnEnv(gym.Env):
         """
         Calculate reward for current step.
 
+        Reward components:
+        1. Penalty for being off-center
+        2. Penalty for wrong size (should fill 30% of lock box)
+        3. Reward for successful lock-on (+1 per step)
+        4. Big bonus for maintaining lock for 5 seconds (+500)
+        5. Penalty for escape (-1000)
+
         Returns:
             float: Reward value
         """
@@ -250,8 +307,10 @@ class LockOnEnv(gym.Env):
         reward -= position_error * 0.001  # Scale down for stability
 
         # 2. Size error penalty
+        # Target should fill 30% of lock box
         current_area = self.target_width * self.target_height
-        area_error = (self.TARGET_AREA - current_area) ** 2
+        desired_area = self.LOCK_BOX_AREA * self.TARGET_FILL_RATIO
+        area_error = (desired_area - current_area) ** 2
         reward -= area_error * 0.00001  # Scale down
 
         # 3. Lock-on reward
@@ -320,12 +379,11 @@ class LockOnEnv(gym.Env):
         surface.fill((0, 0, 0))
 
         # Draw center lock box (30% of screen)
-        lock_box_size = int(np.sqrt(self.TARGET_AREA))
         lock_box_rect = pygame.Rect(
-            self.CENTER_X - lock_box_size // 2,
-            self.CENTER_Y - lock_box_size // 2,
-            lock_box_size,
-            lock_box_size
+            self.CENTER_X - self.LOCK_BOX_SIZE // 2,
+            self.CENTER_Y - self.LOCK_BOX_SIZE // 2,
+            self.LOCK_BOX_SIZE,
+            self.LOCK_BOX_SIZE
         )
         pygame.draw.rect(surface, (50, 50, 50), lock_box_rect, 2)
 
@@ -401,7 +459,9 @@ class LockOnEnv(gym.Env):
         self.target_distance = self.np_random.uniform(0.8, 1.2)
 
         # Calculate initial size
-        base_size = np.sqrt(self.TARGET_AREA)
+        # Target should fill 30% of lock box at distance=1.0
+        desired_target_area = self.LOCK_BOX_AREA * self.TARGET_FILL_RATIO
+        base_size = np.sqrt(desired_target_area)
         size = base_size / self.target_distance
         self.target_width = size
         self.target_height = size
