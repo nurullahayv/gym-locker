@@ -8,6 +8,7 @@ import pygame
 import numpy as np
 import cv2
 from typing import Optional, Tuple, Dict, Any
+from collections import deque
 
 
 class LockOnEnv(gym.Env):
@@ -56,6 +57,7 @@ class LockOnEnv(gym.Env):
         evader_speed_multiplier: float = 1.5,  # Evader is faster than pursuer
         evader_type: str = "simple",  # "simple", "random", or "learned"
         evader_difficulty: float = 0.5,  # 0.0 (easy) to 1.0 (hard)
+        observation_delay: int = 30,  # Observation delay in frames (1 sec at 30 FPS)
     ):
         super().__init__()
 
@@ -69,6 +71,7 @@ class LockOnEnv(gym.Env):
         self.evader_speed_multiplier = evader_speed_multiplier
         self.evader_type = evader_type
         self.evader_difficulty = evader_difficulty
+        self.observation_delay = observation_delay
 
         # Constants
         self.FPS = self.metadata["render_fps"]
@@ -135,6 +138,10 @@ class LockOnEnv(gym.Env):
 
         # Evader state
         self.evader_momentum = np.zeros(2)
+
+        # Observation delay buffer (makes tracking harder)
+        # Agent sees observations from 'observation_delay' frames ago
+        self.observation_buffer = deque(maxlen=observation_delay + 1)
 
         # Font for rendering
         if render_mode == "human":
@@ -558,6 +565,13 @@ class LockOnEnv(gym.Env):
             distance_text = f"Distance: {distance:.0f}px"
             distance_surface = self.small_font.render(distance_text, True, (200, 200, 200))
             surface.blit(distance_surface, (10, y_offset))
+            y_offset += 25
+
+            # Observation delay warning
+            delay_sec = self.observation_delay / self.FPS
+            delay_text = f"Delay: {delay_sec:.1f}s"
+            delay_surface = self.small_font.render(delay_text, True, (255, 165, 0))  # Orange
+            surface.blit(delay_surface, (10, y_offset))
 
         # Convert to RGB array
         frame = pygame.surfarray.array3d(surface)
@@ -605,7 +619,15 @@ class LockOnEnv(gym.Env):
         self.last_pursuer_action = np.zeros(2)
         self.last_evader_action = np.zeros(2)
 
+        # Reset observation buffer
+        self.observation_buffer.clear()
+
         observation = self._get_observation()
+
+        # Fill buffer with initial observation
+        for _ in range(self.observation_delay + 1):
+            self.observation_buffer.append(observation.copy())
+
         info = self._get_info()
 
         return observation, info
@@ -646,8 +668,20 @@ class LockOnEnv(gym.Env):
         # Calculate reward
         reward = self._calculate_reward(terminated)
 
-        # Get new observation
-        observation = self._get_observation()
+        # Get current (true) observation
+        current_observation = self._get_observation()
+
+        # Add to observation buffer
+        self.observation_buffer.append(current_observation.copy())
+
+        # Return delayed observation to agent (makes tracking harder)
+        if len(self.observation_buffer) < self.observation_delay + 1:
+            # During warm-up, return current observation
+            delayed_observation = current_observation
+        else:
+            # Return observation from 'observation_delay' frames ago
+            delayed_observation = self.observation_buffer[0]
+
         info = self._get_info()
 
         # Render if needed
@@ -656,7 +690,7 @@ class LockOnEnv(gym.Env):
             pygame.display.flip()
             self.clock.tick(self.FPS)
 
-        return observation, reward, terminated, truncated, info
+        return delayed_observation, reward, terminated, truncated, info
 
     def _get_info(self) -> Dict[str, Any]:
         """
@@ -689,7 +723,9 @@ class LockOnEnv(gym.Env):
             "in_warning_zone": in_warning_zone,
             "pursuer_action_magnitude": float(np.linalg.norm(self.last_pursuer_action)),
             "evader_action_magnitude": float(np.linalg.norm(self.last_evader_action)),
-            "distance_from_center": float(np.sqrt(self.target_x**2 + self.target_y**2))
+            "distance_from_center": float(np.sqrt(self.target_x**2 + self.target_y**2)),
+            "observation_delay_frames": self.observation_delay,
+            "observation_delay_seconds": self.observation_delay / self.FPS
         }
 
     def render(self) -> Optional[np.ndarray]:

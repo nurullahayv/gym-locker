@@ -19,14 +19,15 @@ from gym_locker.agents.networks import get_feature_extractor
 from gym_locker.utils.visualization import plot_training_metrics
 
 
-def make_env(state_mode="vector", render_mode=None, evader_difficulty=0.5, evader_speed_multiplier=1.5):
+def make_env(state_mode="vector", render_mode=None, evader_difficulty=0.5, evader_speed_multiplier=1.5, observation_delay=30):
     """Create and wrap environment."""
     env = gym.make(
         'LockOn-v0',
         render_mode=render_mode,
         state_mode=state_mode,
         evader_difficulty=evader_difficulty,
-        evader_speed_multiplier=evader_speed_multiplier
+        evader_speed_multiplier=evader_speed_multiplier,
+        observation_delay=observation_delay
     )
     return env
 
