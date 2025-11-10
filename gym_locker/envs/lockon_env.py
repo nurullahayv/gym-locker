@@ -25,13 +25,15 @@ class LockOnEnv(gym.Env):
         Both conditions must be maintained for 5 seconds for successful lock-on.
 
     State Space:
-        - Option A (Vector): [x_diff, y_diff, width, height] - Shape (4,)
-        - Option B (Image): 84x84 grayscale image - Shape (84, 84, 1)
+        - Vector (8D): [target_x, target_y, target_w, target_vx, target_vy,
+                        pursuer_vx, pursuer_vy, pursuer_vz]
+          Includes full state with velocities (Markovian)
+        - Image: 84x84 grayscale image - Shape (84, 84, 1)
 
     Action Space:
-        - Continuous: [pan_x, tilt_y] in range [-1.0, 1.0]
-        - pan_x: horizontal correction vector
-        - tilt_y: vertical correction vector
+        - 3D Acceleration Control: [acc_x, acc_y, acc_z] in range [-1.0, 1.0]
+        - acc_x, acc_y: Horizontal/vertical acceleration
+        - acc_z: Forward/backward acceleration (controls distance/size)
 
     Reward Function (from pursuer's perspective):
         - Centering error penalty: -(x_diff^2 + y_diff^2) * 0.001
@@ -40,19 +42,27 @@ class LockOnEnv(gym.Env):
         - Big bonus: +500 for maintaining lock for 5 seconds
         - Escape penalty: -1000 if target escapes (evader wins!)
 
-    Realistic Flight Physics:
+    Two-Sided Realistic Flight Physics:
+        BOTH pursuer and evader have:
         - Momentum/inertia: Velocity-based movement with acceleration limits
-        - Drag: Air resistance slows down targets over time
+        - Drag: Air resistance slows down over time
         - Angular velocity limits: Can't turn instantly
         - Speed-turn trade-off: High speed reduces turn rate
         - Stall mechanics: Minimum speed required or lose control
-        - Escape mechanics: Target can escape beyond screen boundaries
+
+        Control difference:
+        - Pursuer: Controls 3D acceleration directly (action → velocity → position)
+        - Evader: Uses 2D action → velocity (simpler control)
 
     Evader Dynamics:
         - Evader is faster than pursuer (1.5x speed multiplier by default)
         - Evader has better acceleration (1.3x) and turn rate (1.2x)
         - Smart strategies: aggressive, zigzag, spiral, edge-seeking
         - Makes tracking challenging and requires skilled control
+
+    Key Challenge:
+        Lead prediction is essential! Agent must predict where target will be,
+        accounting for both evader's and its own momentum. Simple tracking fails.
     """
 
     metadata = {"render_modes": ["human", "rgb_array"], "render_fps": 30}
@@ -68,7 +78,7 @@ class LockOnEnv(gym.Env):
         evader_speed_multiplier: float = 1.5,  # Evader is faster than pursuer
         evader_type: str = "simple",  # "simple", "random", or "learned"
         evader_difficulty: float = 0.5,  # 0.0 (easy) to 1.0 (hard)
-        observation_delay: int = 30,  # Observation delay in frames (1 sec at 30 FPS)
+        observation_delay: int = 0,  # Observation delay in frames (0 = no delay)
     ):
         super().__init__()
 
@@ -116,17 +126,31 @@ class LockOnEnv(gym.Env):
         self.EVADER_MAX_ACCELERATION = self.MAX_ACCELERATION * 1.3
         self.EVADER_MAX_ANGULAR_VELOCITY = self.MAX_ANGULAR_VELOCITY * 1.2
 
-        # Action space: [pan_x, tilt_y]
+        # Pursuer physics (same base stats)
+        self.PURSUER_MAX_SPEED = self.MAX_SPEED
+        self.PURSUER_MAX_ACCELERATION = self.MAX_ACCELERATION
+        self.PURSUER_MAX_ANGULAR_VELOCITY = self.MAX_ANGULAR_VELOCITY
+
+        # Action space: [acc_x, acc_y, acc_z] - 3D acceleration control
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(2,), dtype=np.float32
+            low=-1.0, high=1.0, shape=(3,), dtype=np.float32
         )
 
         # Observation space
         if state_mode == "vector":
-            # [x_diff, y_diff, width, height]
+            # [target_x, target_y, target_w, target_vx, target_vy, pursuer_vx, pursuer_vy, pursuer_vz]
+            # Full state with velocities for Markovian property
             self.observation_space = spaces.Box(
-                low=np.array([-screen_width, -screen_height, 0, 0]),
-                high=np.array([screen_width, screen_height, screen_width, screen_height]),
+                low=np.array([
+                    -screen_width, -screen_height, 0,  # target pos + width
+                    -50, -50,  # target velocity bounds
+                    -50, -50, -10  # pursuer velocity bounds
+                ]),
+                high=np.array([
+                    screen_width, screen_height, screen_width,  # target pos + width
+                    50, 50,  # target velocity bounds
+                    50, 50, 10  # pursuer velocity bounds
+                ]),
                 dtype=np.float32
             )
         elif state_mode == "image":
@@ -158,7 +182,7 @@ class LockOnEnv(gym.Env):
         self.total_bonus_earned = 0
         self.escape_count = 0  # Track successful escapes
 
-        # Realistic Physics State
+        # Realistic Physics State - Target (Evader)
         self.target_velocity = np.zeros(2)  # [vx, vy] velocity vector
         self.target_speed = 0.0  # Speed magnitude
         self.target_heading = 0.0  # Direction in radians
@@ -166,9 +190,17 @@ class LockOnEnv(gym.Env):
         self.is_stalled = False
         self.stall_timer = 0
 
+        # Realistic Physics State - Pursuer
+        self.pursuer_velocity = np.zeros(3)  # [vx, vy, vz] velocity vector (3D)
+        self.pursuer_speed = 0.0  # 2D speed magnitude (xy plane)
+        self.pursuer_heading = 0.0  # Direction in radians
+        self.pursuer_angular_velocity = 0.0  # Turn rate
+        self.pursuer_is_stalled = False
+        self.pursuer_stall_timer = 0
+
         # Action visualization (store last actions for rendering)
-        self.last_pursuer_action = np.zeros(2)
-        self.last_evader_action = np.zeros(2)
+        self.last_pursuer_action = np.zeros(3)  # 3D acceleration
+        self.last_evader_action = np.zeros(2)  # 2D action (evader still 2D)
 
         # Evader strategy state
         self.evader_strategy = "aggressive"  # aggressive, zigzag, spiral, edge
@@ -323,13 +355,113 @@ class LockOnEnv(gym.Env):
         else:
             raise ValueError(f"Invalid evader_type: {self.evader_type}")
 
+    def _update_pursuer_physics(self, acceleration_action: np.ndarray) -> None:
+        """
+        Update pursuer's physics based on 3D acceleration input.
+
+        Args:
+            acceleration_action: [acc_x, acc_y, acc_z] normalized to [-1, 1]
+
+        Physics:
+            - Acceleration limits
+            - Velocity update with momentum
+            - Drag/air resistance
+            - Speed clamping
+            - Angular velocity limits (for xy plane)
+            - Stall mechanics
+        """
+        # Scale acceleration action to actual acceleration
+        desired_acceleration = acceleration_action * self.PURSUER_MAX_ACCELERATION
+
+        # 1. Apply acceleration to velocity (3D)
+        self.pursuer_velocity += desired_acceleration
+
+        # 2. Apply drag (air resistance)
+        self.pursuer_velocity *= (1.0 - self.DRAG_COEFFICIENT)
+
+        # 3. Calculate 2D speed (xy plane) and heading
+        pursuer_speed_2d = np.sqrt(self.pursuer_velocity[0]**2 + self.pursuer_velocity[1]**2)
+
+        if pursuer_speed_2d > 0.01:
+            self.pursuer_heading = np.arctan2(self.pursuer_velocity[1], self.pursuer_velocity[0])
+
+        self.pursuer_speed = pursuer_speed_2d
+
+        # 4. Check for stall condition (2D speed)
+        if self.pursuer_speed < self.MIN_SPEED and not self.pursuer_is_stalled:
+            self.pursuer_is_stalled = True
+            self.pursuer_stall_timer = self.STALL_RECOVERY_TIME
+
+        # 5. Handle stall recovery
+        if self.pursuer_is_stalled:
+            self.pursuer_stall_timer -= 1
+
+            # During stall, lose control
+            self.pursuer_velocity[:2] *= 0.95
+
+            # Try to recover by adding forward momentum
+            recovery_force = np.array([
+                np.cos(self.pursuer_heading),
+                np.sin(self.pursuer_heading)
+            ]) * 0.2
+            self.pursuer_velocity[:2] += recovery_force
+
+            # Exit stall when timer expires and speed recovered
+            if self.pursuer_stall_timer <= 0 and self.pursuer_speed >= self.MIN_SPEED:
+                self.pursuer_is_stalled = False
+
+        # 6. Apply angular velocity limits (for xy plane movement)
+        if not self.pursuer_is_stalled and self.pursuer_speed > 0.01:
+            # Calculate desired heading from velocity
+            desired_heading = np.arctan2(self.pursuer_velocity[1], self.pursuer_velocity[0])
+
+            # Calculate angular difference
+            angle_diff = desired_heading - self.pursuer_heading
+            # Normalize to [-pi, pi]
+            while angle_diff > np.pi:
+                angle_diff -= 2 * np.pi
+            while angle_diff < -np.pi:
+                angle_diff += 2 * np.pi
+
+            # Speed-turn trade-off
+            speed_factor = self.pursuer_speed / self.PURSUER_MAX_SPEED
+            effective_max_angular_velocity = self.PURSUER_MAX_ANGULAR_VELOCITY * (
+                1.0 - self.TURN_SPEED_FACTOR * speed_factor
+            )
+
+            # Limit angular change
+            max_angle_change = effective_max_angular_velocity
+            actual_angle_change = np.clip(angle_diff, -max_angle_change, max_angle_change)
+
+            # Update heading
+            self.pursuer_heading += actual_angle_change
+
+            # Adjust xy velocity to match limited heading (preserve z velocity)
+            self.pursuer_velocity[:2] = np.array([
+                np.cos(self.pursuer_heading) * self.pursuer_speed,
+                np.sin(self.pursuer_heading) * self.pursuer_speed
+            ])
+
+        # 7. Clamp 2D speed to valid range (if not stalled)
+        if not self.pursuer_is_stalled:
+            if self.pursuer_speed > self.PURSUER_MAX_SPEED:
+                self.pursuer_velocity[:2] *= self.PURSUER_MAX_SPEED / self.pursuer_speed
+                self.pursuer_speed = self.PURSUER_MAX_SPEED
+
+        # 8. Clamp z-velocity (depth) separately (slower movement in z)
+        max_z_speed = 5.0
+        self.pursuer_velocity[2] = np.clip(self.pursuer_velocity[2], -max_z_speed, max_z_speed)
+
     def _update_target_position(
         self,
         pursuer_action: np.ndarray,
         evader_action: np.ndarray
     ) -> None:
         """
-        Update target position with realistic flight physics.
+        Update target position with TWO-SIDED realistic flight physics.
+
+        BOTH pursuer and evader have momentum, drag, angular limits, and stall risk.
+        Pursuer controls 3D acceleration, evader uses 2D action → velocity.
 
         Physics includes:
         - Momentum/inertia (velocity-based movement)
@@ -341,15 +473,14 @@ class LockOnEnv(gym.Env):
 
         Evader has better stats (faster, more agile) making tracking challenging.
         """
-        # Calculate net motion vector
+        # ==== STEP 1: Update Pursuer Physics (3D acceleration control) ====
+        self._update_pursuer_physics(pursuer_action)
+
+        # ==== STEP 2: Update Evader Physics (2D action → velocity) ====
+        # Evader action → desired velocity
         evader_x = evader_action[0] * self.evader_speed_multiplier
         evader_y = evader_action[1] * self.evader_speed_multiplier
-
-        net_vector_x = evader_x - pursuer_action[0]
-        net_vector_y = evader_y - pursuer_action[1]
-
-        # Calculate desired velocity from actions
-        desired_velocity = np.array([net_vector_x, net_vector_y]) * self.speed_coefficient
+        desired_velocity = np.array([evader_x, evader_y]) * self.speed_coefficient
 
         # 1. Calculate acceleration (with limits)
         velocity_diff = desired_velocity - self.target_velocity
@@ -434,16 +565,26 @@ class LockOnEnv(gym.Env):
                 self.target_velocity *= self.EVADER_MAX_SPEED / self.target_speed
                 self.target_speed = self.EVADER_MAX_SPEED
 
-        # 9. Update position from velocity
-        self.target_x += self.target_velocity[0]
-        self.target_y += self.target_velocity[1]
+        # ==== STEP 3: Calculate Relative Motion (Egocentric) ====
+        # In egocentric view, pursuer is always at center
+        # Target appears to move based on relative velocity
+        relative_velocity_x = self.target_velocity[0] - self.pursuer_velocity[0]
+        relative_velocity_y = self.target_velocity[1] - self.pursuer_velocity[1]
 
-        # 10. Distance/size update (Z-axis simplified)
-        evader_z = np.random.randn() * 0.1 * self.evader_difficulty
-        pursuer_z = 0.0
-        net_vector_z = evader_z - pursuer_z
+        # 9. Update target position (egocentric)
+        self.target_x += relative_velocity_x
+        self.target_y += relative_velocity_y
 
-        self.target_distance += net_vector_z * 0.5
+        # 10. Distance/size update (Z-axis: pursuer's z-velocity controls distance)
+        # Positive pursuer_vz = moving forward = approaching target = distance decreases
+        # Negative pursuer_vz = moving backward = retreating = distance increases
+        self.target_distance -= self.pursuer_velocity[2] * 0.1  # Scale factor for distance change
+
+        # Add small random perturbation (evader's z movement)
+        evader_z_noise = np.random.randn() * 0.05 * self.evader_difficulty
+        self.target_distance += evader_z_noise
+
+        # Clamp distance
         self.target_distance = np.clip(self.target_distance, 0.3, 3.0)
 
         # Convert distance to size (inverse relationship)
@@ -571,6 +712,10 @@ class LockOnEnv(gym.Env):
         """
         Get current observation based on state_mode.
 
+        For vector mode:
+            Full state observation with velocities (Markovian):
+            [target_x, target_y, target_w, target_vx, target_vy, pursuer_vx, pursuer_vy, pursuer_vz]
+
         Returns:
             np.ndarray: Observation
         """
@@ -579,7 +724,11 @@ class LockOnEnv(gym.Env):
                 self.target_x,
                 self.target_y,
                 self.target_width,
-                self.target_height
+                self.target_velocity[0],  # target vx (relative)
+                self.target_velocity[1],  # target vy (relative)
+                self.pursuer_velocity[0],  # pursuer vx
+                self.pursuer_velocity[1],  # pursuer vy
+                self.pursuer_velocity[2]   # pursuer vz
             ], dtype=np.float32)
 
         elif self.state_mode == "image":
@@ -822,6 +971,30 @@ class LockOnEnv(gym.Env):
                 escape_text = f"Escapes: {self.escape_count}"
                 escape_surface = self.small_font.render(escape_text, True, (255, 0, 255))
                 surface.blit(escape_surface, (10, y_offset))
+                y_offset += 25
+
+            # Separator
+            y_offset += 10
+
+            # Pursuer physics info
+            pursuer_speed_text = f"P-Speed: {self.pursuer_speed:.1f}px/f"
+            pursuer_speed_color = (0, 255, 0) if self.pursuer_speed >= self.MIN_SPEED else (255, 0, 0)
+            pursuer_speed_surface = self.small_font.render(pursuer_speed_text, True, pursuer_speed_color)
+            surface.blit(pursuer_speed_surface, (10, y_offset))
+            y_offset += 25
+
+            # Pursuer heading
+            pursuer_heading_deg = np.rad2deg(self.pursuer_heading) % 360
+            pursuer_heading_text = f"P-Heading: {pursuer_heading_deg:.0f}°"
+            pursuer_heading_surface = self.small_font.render(pursuer_heading_text, True, (100, 150, 255))
+            surface.blit(pursuer_heading_surface, (10, y_offset))
+            y_offset += 25
+
+            # Pursuer stall warning
+            if self.pursuer_is_stalled:
+                pursuer_stall_text = f"P-STALL! ({self.pursuer_stall_timer})"
+                pursuer_stall_surface = self.small_font.render(pursuer_stall_text, True, (255, 100, 0))
+                surface.blit(pursuer_stall_surface, (10, y_offset))
 
         # Convert to RGB array
         frame = pygame.surfarray.array3d(surface)
@@ -878,18 +1051,27 @@ class LockOnEnv(gym.Env):
         self.evader_strategy_timer = 0
         self.evader_zigzag_phase = 0
 
+        # Reset pursuer physics
+        self.pursuer_velocity = np.zeros(3)
+        self.pursuer_speed = 0.0
+        self.pursuer_heading = self.np_random.uniform(0, 2 * np.pi)  # Random initial heading
+        self.pursuer_angular_velocity = 0.0
+        self.pursuer_is_stalled = False
+        self.pursuer_stall_timer = 0
+
         # Reset action visualization
-        self.last_pursuer_action = np.zeros(2)
+        self.last_pursuer_action = np.zeros(3)  # 3D acceleration
         self.last_evader_action = np.zeros(2)
 
-        # Reset observation buffer
+        # Reset observation buffer (only if delay > 0)
         self.observation_buffer.clear()
 
         observation = self._get_observation()
 
-        # Fill buffer with initial observation
-        for _ in range(self.observation_delay + 1):
-            self.observation_buffer.append(observation.copy())
+        # Fill buffer with initial observation (only if delay > 0)
+        if self.observation_delay > 0:
+            for _ in range(self.observation_delay + 1):
+                self.observation_buffer.append(observation.copy())
 
         info = self._get_info()
 
@@ -903,10 +1085,10 @@ class LockOnEnv(gym.Env):
         Execute one step in the environment.
 
         Args:
-            action: Pursuer's action [pan_x, tilt_y]
+            action: Pursuer's 3D acceleration [acc_x, acc_y, acc_z]
 
         Returns:
-            observation: New observation
+            observation: New observation (8D with velocities)
             reward: Reward for this step
             terminated: Whether episode ended due to failure
             truncated: Whether episode ended due to time limit
@@ -921,7 +1103,7 @@ class LockOnEnv(gym.Env):
         self.last_pursuer_action = action.copy()
         self.last_evader_action = evader_action.copy()
 
-        # Update target position and size
+        # Update target position and size (two-sided physics)
         self._update_target_position(action, evader_action)
 
         # Check termination conditions
@@ -932,19 +1114,17 @@ class LockOnEnv(gym.Env):
         # Calculate reward
         reward = self._calculate_reward(terminated, escaped)
 
-        # Get current (true) observation
-        current_observation = self._get_observation()
+        # Get observation
+        observation = self._get_observation()
 
-        # Add to observation buffer
-        self.observation_buffer.append(current_observation.copy())
-
-        # Return delayed observation to agent (makes tracking harder)
-        if len(self.observation_buffer) < self.observation_delay + 1:
-            # During warm-up, return current observation
-            delayed_observation = current_observation
-        else:
-            # Return observation from 'observation_delay' frames ago
-            delayed_observation = self.observation_buffer[0]
+        # Optional: observation delay (if enabled)
+        if self.observation_delay > 0:
+            self.observation_buffer.append(observation.copy())
+            if len(self.observation_buffer) < self.observation_delay + 1:
+                delayed_observation = observation
+            else:
+                delayed_observation = self.observation_buffer[0]
+            observation = delayed_observation
 
         info = self._get_info()
 
@@ -990,7 +1170,7 @@ class LockOnEnv(gym.Env):
             "distance_from_center": float(np.sqrt(self.target_x**2 + self.target_y**2)),
             "observation_delay_frames": self.observation_delay,
             "observation_delay_seconds": self.observation_delay / self.FPS,
-            # Physics info
+            # Physics info - Target (Evader)
             "target_speed": float(self.target_speed),
             "target_velocity_x": float(self.target_velocity[0]),
             "target_velocity_y": float(self.target_velocity[1]),
@@ -999,7 +1179,16 @@ class LockOnEnv(gym.Env):
             "is_stalled": self.is_stalled,
             "stall_timer": self.stall_timer,
             "evader_strategy": self.evader_strategy,
-            "escape_count": self.escape_count
+            "escape_count": self.escape_count,
+            # Physics info - Pursuer
+            "pursuer_speed": float(self.pursuer_speed),
+            "pursuer_velocity_x": float(self.pursuer_velocity[0]),
+            "pursuer_velocity_y": float(self.pursuer_velocity[1]),
+            "pursuer_velocity_z": float(self.pursuer_velocity[2]),
+            "pursuer_heading": float(self.pursuer_heading),
+            "pursuer_heading_degrees": float(np.rad2deg(self.pursuer_heading) % 360),
+            "pursuer_is_stalled": self.pursuer_is_stalled,
+            "pursuer_stall_timer": self.pursuer_stall_timer
         }
 
     def render(self) -> Optional[np.ndarray]:
