@@ -13,7 +13,10 @@ class SimpleMLP(BaseFeaturesExtractor):
     Simple Multi-Layer Perceptron for vector state space.
 
     Architecture:
-        Input (4) -> Hidden (64) -> Hidden (64) -> Output (features_dim)
+        Input (8D: pos+vel) -> Hidden (64) -> Hidden (64) -> Output (features_dim)
+
+    Input: [target_x, target_y, target_w, target_vx, target_vy,
+            pursuer_vx, pursuer_vy, pursuer_vz]
     """
 
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 64):
@@ -44,7 +47,10 @@ class DeepMLP(BaseFeaturesExtractor):
     Deeper MLP for more complex learning.
 
     Architecture:
-        Input (4) -> Hidden (128) -> Hidden (128) -> Hidden (64) -> Output (features_dim)
+        Input (8D: pos+vel) -> Hidden (128) -> Hidden (128) -> Hidden (64) -> Output (features_dim)
+
+    Input: [target_x, target_y, target_w, target_vx, target_vy,
+            pursuer_vx, pursuer_vy, pursuer_vz]
     """
 
     def __init__(self, observation_space: gym.spaces.Box, features_dim: int = 64):

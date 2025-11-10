@@ -47,13 +47,19 @@ def demo_random_policy():
 
 def demo_manual_control():
     """
-    Demo with keyboard control (arrow keys).
+    Demo with keyboard control.
+
+    3D acceleration control:
+    - Arrow Keys: XY acceleration
+    - W/S: Z acceleration (forward/backward)
     """
     print("=" * 60)
-    print("Demo: Manual Control")
+    print("Demo: Manual Control (3D Acceleration)")
     print("=" * 60)
     print("\nControls:")
-    print("  Arrow Keys: Move target correction")
+    print("  Arrow Keys (Left/Right): X acceleration")
+    print("  Arrow Keys (Up/Down): Y acceleration")
+    print("  W/S: Z acceleration (forward/backward)")
     print("  ESC: Quit")
     print("  R: Reset episode")
     print("\nStarting in 3 seconds...")
@@ -69,8 +75,8 @@ def demo_manual_control():
     steps = 0
 
     while running:
-        # Default action (no movement)
-        action = [0.0, 0.0]
+        # Default action (no acceleration)
+        action = [0.0, 0.0, 0.0]
 
         # Handle events
         for event in pygame.event.get():
@@ -88,7 +94,8 @@ def demo_manual_control():
         # Get keyboard state
         keys = pygame.key.get_pressed()
 
-        # Map arrow keys to actions
+        # Map keys to 3D acceleration
+        # XY plane
         if keys[pygame.K_LEFT]:
             action[0] -= 0.5
         if keys[pygame.K_RIGHT]:
@@ -97,6 +104,12 @@ def demo_manual_control():
             action[1] -= 0.5
         if keys[pygame.K_DOWN]:
             action[1] += 0.5
+
+        # Z axis (depth)
+        if keys[pygame.K_w]:
+            action[2] += 0.5  # Forward (approach target)
+        if keys[pygame.K_s]:
+            action[2] -= 0.5  # Backward (retreat)
 
         # Clip action to valid range
         action = [max(-1.0, min(1.0, a)) for a in action]

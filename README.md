@@ -4,6 +4,8 @@
 
 Gym-Locker is a Gymnasium-based simulation environment that trains RL agents to maintain a lock-on target tracking system. The agent must keep a moving target centered on screen at a specific size (representing distance) for 5 seconds to achieve a successful lock-on.
 
+
+> **⚠️ Latest Update (v2.0)**: Environment now uses **two-sided acceleration control** with **full state observation** (8D with velocities). Both pursuer and evader have realistic flight physics with momentum, drag, and angular velocity limits. This is a breaking change - retrain all models!
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Python](https://img.shields.io/badge/python-3.8%2B-blue)
 ![Gymnasium](https://img.shields.io/badge/gymnasium-0.29%2B-green)
@@ -26,7 +28,7 @@ Gym-Locker is a Gymnasium-based simulation environment that trains RL agents to 
 - **Egocentric Simulation**: Simplified "ben-merkezci" (ego-centric) tracking without full 3D physics
 - **Gymnasium Compatible**: Standard RL environment interface
 - **Multiple State Representations**:
-  - Vector mode: `[x_diff, y_diff, width, height]` (fast, for MLP)
+  - Vector mode: `[target_x, target_y, target_w, target_vx, target_vy, pursuer_vx, pursuer_vy, pursuer_vz]` (8D with velocities, Markovian)
   - Image mode: 84x84 grayscale (for CNN)
 - **PID Baseline**: Traditional control theory baseline for comparison
 - **Hybrid PID+RL**: Combine stability of PID with learning capability of RL
@@ -150,12 +152,15 @@ state = [x_diff, y_diff, width, height]
 
 ### Action Space
 
-Continuous action space:
+**3D Acceleration Control** - realistic physics-based control:
 ```python
-action = [pan_x, tilt_y]  # Each in range [-1.0, 1.0]
+action = [acc_x, acc_y, acc_z]  # Each in range [-1.0, 1.0]
 ```
-- `pan_x`: Horizontal correction vector
-- `tilt_y`: Vertical correction vector
+- `acc_x`: Horizontal acceleration
+- `acc_y`: Vertical acceleration  
+- `acc_z`: Forward/backward acceleration (controls distance to target)
+
+**Key Change**: Agent now controls acceleration, not direct position. Pursuer has momentum, inertia, drag, and angular velocity limits.
 
 ### Reward Function
 
