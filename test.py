@@ -60,7 +60,7 @@ def test_pid_controller():
     print("=" * 60)
 
     env = gym.make('LockOn-v0', render_mode="human", state_mode="vector")
-    pid = PIDController(kp=0.1, ki=0.01, kd=0.05)
+    pid = PIDController(kp_xy=0.1, kd_xy=0.05, kp_z=0.3, ki_z=0.01, kd_z=0.1)
     pid.set_sample_time(env.metadata["render_fps"])
 
     print("\nRunning PID controller for 1 episode...")
@@ -169,7 +169,7 @@ def test_hybrid_controller(model_path, state_mode="vector", pid_weight=0.7, rl_w
     env = gym.make('LockOn-v0', render_mode="human", state_mode=state_mode)
 
     # Create hybrid controller
-    pid = PIDController(kp=0.1, ki=0.01, kd=0.05)
+    pid = PIDController(kp_xy=0.1, kd_xy=0.05, kp_z=0.3, ki_z=0.01, kd_z=0.1)
     pid.set_sample_time(env.metadata["render_fps"])
     hybrid = HybridPIDRLController(pid, rl_model, pid_weight, rl_weight)
 
@@ -226,7 +226,7 @@ def record_video(
 
     # Create controller
     if controller_type == "pid":
-        controller = PIDController(kp=0.1, ki=0.01, kd=0.05)
+        controller = PIDController(kp_xy=0.1, kd_xy=0.05, kp_z=0.3, ki_z=0.01, kd_z=0.1)
         controller.set_sample_time(env.metadata["render_fps"])
     elif controller_type == "rl":
         if model_path is None:
@@ -246,7 +246,7 @@ def record_video(
             rl_model = SAC.load(model_path)
         elif "TD3" in model_path:
             rl_model = TD3.load(model_path)
-        pid = PIDController(kp=0.1, ki=0.01, kd=0.05)
+        pid = PIDController(kp_xy=0.1, kd_xy=0.05, kp_z=0.3, ki_z=0.01, kd_z=0.1)
         pid.set_sample_time(env.metadata["render_fps"])
         controller = HybridPIDRLController(pid, rl_model, 0.7, 0.3)
     else:

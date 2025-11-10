@@ -112,7 +112,7 @@ def demo_manual_control():
             action[2] -= 0.5  # Backward (retreat)
 
         # Clip action to valid range
-        action = [max(-1.0, min(1.0, a)) for a in action]
+        action = np.array([max(-1.0, min(1.0, a)) for a in action], dtype=np.float32)
 
         # Step
         obs, reward, terminated, truncated, info = env.step(action)
