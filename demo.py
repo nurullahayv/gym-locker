@@ -15,7 +15,8 @@ def demo_random_policy():
     print("Demo: Random Policy")
     print("=" * 60)
 
-    env = gym.make('LockOn-v0', render_mode="human", state_mode="vector")
+    env = gym.make('LockOn-v0', render_mode="human", state_mode="vector",
+                   evader_difficulty=0.5, evader_speed_multiplier=1.0, observation_delay=3)
 
     for episode in range(3):
         print(f"\nEpisode {episode + 1}/3")
@@ -67,7 +68,8 @@ def demo_manual_control():
 
     import pygame
 
-    env = gym.make('LockOn-v0', render_mode="human", state_mode="vector")
+    env = gym.make('LockOn-v0', render_mode="human", state_mode="vector",
+                   evader_difficulty=0.5, evader_speed_multiplier=1.0, observation_delay=3)
     obs, info = env.reset()
 
     running = True
