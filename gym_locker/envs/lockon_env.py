@@ -18,8 +18,8 @@ class LockOnEnv(gym.Env):
     for 5 consecutive seconds to succeed.
 
     Lock-on Conditions:
-        1. Target must be FULLY inside the lock box (center square, 30% of screen)
-        2. Target must fill approximately 30% of the lock box area
+        1. Target must be inside the lock box (center square, 30% of screen)
+        2. Target must fill at least 5% of the lock box area
         Both conditions must be maintained for 5 seconds for successful lock-on.
 
     State Space:
@@ -52,7 +52,7 @@ class LockOnEnv(gym.Env):
         screen_width: int = 800,
         screen_height: int = 600,
         target_area_ratio: float = 0.30,  # Lock box size (30% of screen)
-        speed_coefficient: float = 2.0,
+        speed_coefficient: float = 4.0,  # Higher speed for more dynamic tracking
         evader_speed_multiplier: float = 1.5,  # Evader is faster than pursuer
         evader_type: str = "simple",  # "simple", "random", or "learned"
         evader_difficulty: float = 0.5,  # 0.0 (easy) to 1.0 (hard)
@@ -83,10 +83,10 @@ class LockOnEnv(gym.Env):
         self.LOCK_BOX_SIZE = int(np.sqrt(self.LOCK_BOX_AREA))
 
         # Lock-on conditions:
-        # 1. Target must be FULLY inside the lock box
-        # 2. Target must fill 30% of the lock box (with tolerance)
-        self.TARGET_FILL_RATIO = 0.30  # Target should fill 30% of lock box
-        self.TARGET_FILL_TOLERANCE = 0.10  # Accept 20%-40% (30% ± 10%)
+        # 1. Target must be inside the lock box
+        # 2. Target must fill at least 5% of the lock box area
+        self.TARGET_FILL_RATIO = 0.05  # Target should fill at least 5% of lock box
+        self.TARGET_FILL_TOLERANCE = 1.0  # Accept any size >= 5%
 
         # Action space: [pan_x, tilt_y]
         self.action_space = spaces.Box(
@@ -229,8 +229,8 @@ class LockOnEnv(gym.Env):
         Check if target is currently locked on.
 
         Lock-on conditions:
-        1. Target must be FULLY inside the lock box (centered square)
-        2. Target must fill approximately 30% of the lock box area
+        1. Target must be inside the lock box (centered square)
+        2. Target must fill at least 5% of the lock box area
 
         Returns:
             bool: True if both conditions are met
@@ -250,20 +250,20 @@ class LockOnEnv(gym.Env):
         lock_box_top = self.CENTER_Y - self.LOCK_BOX_SIZE / 2
         lock_box_bottom = self.CENTER_Y + self.LOCK_BOX_SIZE / 2
 
-        # Condition 1: Target must be FULLY inside the lock box
+        # Condition 1: Target must be inside the lock box (at least partially)
         inside_box = (
-            target_left >= lock_box_left and
-            target_right <= lock_box_right and
-            target_top >= lock_box_top and
-            target_bottom <= lock_box_bottom
+            target_right > lock_box_left and
+            target_left < lock_box_right and
+            target_bottom > lock_box_top and
+            target_top < lock_box_bottom
         )
 
-        # Condition 2: Target must fill ~30% of lock box area
+        # Condition 2: Target must fill at least 5% of lock box area
         target_area = self.target_width * self.target_height
         fill_ratio = target_area / self.LOCK_BOX_AREA
 
-        # Check if fill ratio is within acceptable range (30% ± tolerance)
-        fill_ok = abs(fill_ratio - self.TARGET_FILL_RATIO) <= self.TARGET_FILL_TOLERANCE
+        # Check if fill ratio is at least 5%
+        fill_ok = fill_ratio >= self.TARGET_FILL_RATIO
 
         # Both conditions must be true for successful lock-on
         return inside_box and fill_ok
