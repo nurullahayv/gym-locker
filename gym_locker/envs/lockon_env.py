@@ -600,7 +600,7 @@ class LockOnEnv(gym.Env):
         Check if target is currently locked on.
 
         Lock-on conditions:
-        1. Target must be inside the lock box (centered square)
+        1. Target must be COMPLETELY inside the lock box (not partially)
         2. Target must fill at least 5% of the lock box area
 
         Returns:
@@ -621,12 +621,13 @@ class LockOnEnv(gym.Env):
         lock_box_top = self.CENTER_Y - self.LOCK_BOX_SIZE / 2
         lock_box_bottom = self.CENTER_Y + self.LOCK_BOX_SIZE / 2
 
-        # Condition 1: Target must be inside the lock box (at least partially)
+        # Condition 1: Target must be COMPLETELY inside the lock box
+        # All edges of target must be within lock box bounds
         inside_box = (
-            target_right > lock_box_left and
-            target_left < lock_box_right and
-            target_bottom > lock_box_top and
-            target_top < lock_box_bottom
+            target_left >= lock_box_left and
+            target_right <= lock_box_right and
+            target_top >= lock_box_top and
+            target_bottom <= lock_box_bottom
         )
 
         # Condition 2: Target must fill at least 5% of lock box area
