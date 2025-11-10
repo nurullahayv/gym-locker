@@ -1134,7 +1134,7 @@ class LockOnEnv(gym.Env):
             pygame.display.flip()
             self.clock.tick(self.FPS)
 
-        return delayed_observation, reward, terminated, truncated, info
+        return observation, reward, terminated, truncated, info
 
     def _get_info(self) -> Dict[str, Any]:
         """
