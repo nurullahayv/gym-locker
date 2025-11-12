@@ -57,7 +57,7 @@ def evaluate_pid_baseline(n_episodes=100, render=False):
     env = make_env(state_mode="vector", render_mode=render_mode)
 
     # Create PID controller
-    pid = PIDController(kp=0.1, ki=0.01, kd=0.05)
+    pid = PIDController(kp_xy=0.1, kd_xy=0.05, kp_z=0.3, ki_z=0.01, kd_z=0.1, desired_size=120.0)
     pid.set_sample_time(env.metadata["render_fps"])
 
     # Evaluate
